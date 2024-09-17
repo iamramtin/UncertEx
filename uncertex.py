@@ -10,8 +10,7 @@ Usage:
 Options:
     -f, --from: Source currency (default: GBP)
     -t, --to: Target currency (default: EUR)
-    --min-rate: Minimum conversion rate (default: 1.15)
-    --max-rate: Maximum conversion rate (default: 1.20)
+    -v, --variance: Variance in exchange rate as a percentage (default: 2.0)
     -j, --json: Output results as JSON
 
 Example:
@@ -35,6 +34,8 @@ from enum import Enum
 SIGNALOID_API_URL = "https://api.signaloid.io"
 SIGNALOID_API_KEY = os.environ.get("SIGNALOID_API_KEY")
 SIGNALOID_CORE_ID = os.environ.get("SIGNALOID_CORE_ID")
+EXCHANGE_RATE_API_URL = "https://api.exchangerate-api.com/v4/latest"
+EXCHANGE_RATE_API_KEY = os.environ.get("EXCHANGE_RATE_API_KEY")
 
 
 class TaskStatus(Enum):
@@ -53,14 +54,17 @@ def get_args() -> argparse.Namespace:
     parser.add_argument('-f', '--from', dest='from_currency', default='GBP', help='Source currency (default: GBP)')
     parser.add_argument('-t', '--to', dest='to_currency', default='EUR', help='Target currency (default: EUR)')
     parser.add_argument('--min-rate', type=float, default=1.15, help='Minimum conversion rate')
-    parser.add_argument('--max-rate', type=float, default=1.2, help='Maximum conversion rate')
+    parser.add_argument('--variance', type=float, default=2.0, help='Variance in exchange rate as a percentage (default: 2.0)')
     parser.add_argument('-j', '--json', action='store_true', help='Output results as JSON')
     
     return parser.parse_args()
 
 
-def create_task_object(amount: float, min_rate: float, max_rate: float) -> dict[str, any]:
+def create_task_object(amount: float, rate: float, variance: float) -> dict[str, any]:
     """Create a task object with the given parameters for the Signaloid API."""
+    min_rate = rate * (1 - variance/100)
+    max_rate = rate * (1 + variance/100)
+    
     source_code = f'''
         #include <math.h>
         #include <stdint.h>
@@ -96,6 +100,17 @@ def create_task_object(amount: float, min_rate: float, max_rate: float) -> dict[
     }
 
 
+def get_exchange_rates(from_currency: str, to_currency: str) -> dict[str, float]:
+    """Retrieve current exchange rates from the API."""
+    response = requests.get(f"{EXCHANGE_RATE_API_URL}/{from_currency}?api_key={EXCHANGE_RATE_API_KEY}")
+
+    if response.status_code == 200:
+        data = response.json()
+        return data['rates'][to_currency]
+    else:
+        raise Exception(f"Failed to fetch exchange rates. Status code: {response.status_code}")
+
+
 def create_task(task_object: dict[str, any]) -> dict[str, any]:
     """Create a new task with the given payload using the Signaloid API."""
     headers = {"Authorization": SIGNALOID_API_KEY, "Content-Type": "application/json"}
@@ -104,7 +119,7 @@ def create_task(task_object: dict[str, any]) -> dict[str, any]:
     if response.status_code == 202:
         return response.json()
     else:
-        raise Exception(f"API call to Signaloid failed with status code: {response.status_code}; error: {response.json()}")
+        raise Exception(f"Failed to create task. Status code: {response.status_code}. {response.json()}")
 
 
 def get_task_status(task_id: str) -> dict[str, any]:
@@ -221,7 +236,7 @@ def format_output_as_json(amount: float, min_rate: float, max_rate: float, from_
 
 
 def process_task_output(task_status: TaskStatus, task_output: dict[str, str], 
-                        from_currency: str, to_currency: str, min_rate: float, max_rate: float, 
+                        from_currency: str, to_currency: str, rate: float, variance: float, 
                         json_output: bool) -> None:
     """Process and display the task output."""
     if task_status == TaskStatus.COMPLETED:
@@ -232,9 +247,10 @@ def process_task_output(task_status: TaskStatus, task_output: dict[str, str],
             try:
                 stdout_response = parse_custom_json(decoded_response)
                 amount = stdout_response['amount']
-                rate = stdout_response['rate']
                 result = stdout_response['result']
 
+                min_rate = rate * (1 - variance/100)
+                max_rate = rate * (1 + variance/100)
                 samples = generate_samples(amount, min_rate, max_rate)
                 
                 if json_output:
@@ -242,7 +258,7 @@ def process_task_output(task_status: TaskStatus, task_output: dict[str, str],
                     print(json.dumps(output, indent=2))
                 else:
                     print(f"\nAmount: {amount:.2f} {from_currency}")
-                    print(f"Average Rate: {rate:.4f}")
+                    print(f"Average Rate: {rate:.4f} (±{variance}%)")
                     print(f"Average Result: {result:.2f} {to_currency}")
                     
                     mean = np.mean(samples)
@@ -288,11 +304,18 @@ def main() -> None:
     print("Welcome to UncertEx: Currency Converter with Uncertainty")
     args = get_args()
     
+    try:
+        rate = get_exchange_rates(args.from_currency, args.to_currency)
+    except Exception as e:
+        print(f"Error fetching exchange rates: {e}")
+        return
+    
     if not args.json:
         print(f"\nConverting {args.amount} {args.from_currency} to {args.to_currency}")
-        print(f"Using conversion rate uniformly distributed between {args.min_rate} and {args.max_rate}")
+        print(f"Current exchange rate: 1 {args.from_currency} = {rate:.4f} {args.to_currency}")
+        print(f"Using a variance of ±{args.variance}%")
     
-    task_object = create_task_object(args.amount, args.min_rate, args.max_rate)
+    task_object = create_task_object(args.amount, rate, args.variance)
     task = create_task(task_object)
     task_id = task['TaskID']
     
@@ -305,7 +328,7 @@ def main() -> None:
         print(f"Task completed with status: {task_status.value}.")
     
     task_output = get_task_output(task_id)
-    process_task_output(task_status, task_output, args.from_currency, args.to_currency, args.min_rate, args.max_rate, args.json)
+    process_task_output(task_status, task_output, args.from_currency, args.to_currency, rate, args.variance, args.json)
 
 
 if __name__ == "__main__":
